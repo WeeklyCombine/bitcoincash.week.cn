@@ -1,0 +1,698 @@
+# bch源码阅读 -- 启动流程step0
+
+
+选取的源代码版本是bitcoin-abc v0.17.2，最新commit hash是f5f1555c，让我们以守护进程bitcond的初始化作为切入点吧
+
+之所以是step0，是因为程序将初始化的主要部分分为了step1到step12，现在正处于step1前面的阶段，就叫step0了^-^
+
+可能会写得比较乱，想到啥写啥，会持续更新，水平有限，欢迎讨论指正
+
+--------------------------------------------
+__当前位置：__ bitcoind.cpp 第202行 main()
+```c++
+int main(int argc, char *argv[]) {
+    SetupEnvironment();
+
+    // Connect bitcoind signal handlers
+    noui_connect();
+
+    return (AppInit(argc, argv) ? EXIT_SUCCESS : EXIT_FAILURE);
+}
+```
+一共三个函数，从字面意思理解：
+* 设置环境
+* 一个观察者的注册设置（注释中有signal，函数名带有connect），noui是什么的缩写意思？
+* 初始化主体（argc/argv参数都传给此函数了）  
+
+一个一个看。  
+
+-----------------------------------------------------
+__当前位置：__ util.cpp 第584行 SetupEnvironment()
+```c++
+void SetupEnvironment() {
+#ifdef HAVE_MALLOPT_ARENA_MAX
+    // glibc-specific: On 32-bit systems set the number of arenas to 1. By
+    // default, since glibc 2.10, the C library will create up to two heap
+    // arenas per core. This is known to cause excessive virtual address space
+    // usage in our usage. Work around it by setting the maximum number of
+    // arenas to 1.
+    if (sizeof(void *) == 4) {
+        mallopt(M_ARENA_MAX, 1);
+    }
+#endif
+```
+从注释来看，这是一个针对glibc的设置：在32位系统中将arena数设置为1。  
+理由是默认情况下glibc会为每个核心(CPU)创建2个arena，这就会造成对虚拟地址空间的过多使用，32位总共才4G嘛。  
+
+那这个arena到底是个啥？  
+通过man mallopt查看对M_ARENA_MAX的说明：一个arena表示一个可以为malloc所使用的内存池，它是线程安全的，这里就有一个线程数和arena数的权衡，arena越多，线程之间的竞争就越少，但是内存使用会变高。
+
+sizeof(void*) == 4 用来判断是否是32位系统，如果是64位则应该等于8。  
+mallopt的声明位于malloc.h，内存分配相关参数的设置，M_ARENA_MAX就是其中一种。
+ 
+调试时一直进不去这段代码，反推HAVE_MALLOPT_ARENA_MAX这个宏没有define，经搜索宏是定义在config/bitcoin_config.h中，而util.cpp文件开头声明头文件时声明：如果define了HAVE_CONFIG_H这个宏，那么就会声明bitcoin_config.h头文件，而HAVE_CONFIG_H定义在了makefile文件DEFS变量中，DEFS = -DHAVE_CONFIG_H，-D就是宏定义的意思，矛盾了。而我调试时print HAVE_MALLOPT_ARENA_MAX的值是也是1。一定是哪里我弄错了...
+
+```c++
+// On most POSIX systems (e.g. Linux, but not BSD) the environment's locale may
+// be invalid, in which case the "C" locale is used as fallback.
+#if !defined(WIN32) && !defined(MAC_OSX) && !defined(__FreeBSD__) &&           \
+    !defined(__OpenBSD__)
+    try {
+        // Raises a runtime error if current locale is invalid.
+        std::locale("");
+    } catch (const std::runtime_error &) {
+        setenv("LC_ALL", "C", 1);
+    }
+#endif
+```
+注释的意思是：在大多数使用POSIX标准的系统中（比如Linux，非BSD），参照系统环境来初始本地化可能会失败，此时就用C的本地化来做备用。  
+
+std::locale("")表示使用环境变量（通常是LANG）来构造一个本地化（注意这里不是设置程序的本地化，仅仅只是构造了一个本地化对象），如果失败了就将环境变量本地化设置为C语境。  
+
+这段代码其实表明了程序初始化时本地化的默认值是参照系统环境变量来的，而不是经典的C语境，在《C++标准库》第二版16.2.1节中也有一段话表达了这个意思。locale默认是C的一种解释是std::locale()这种不带参数的构造默认返回C语境，这是由std::locale::golbal()决定的，它默认返回std::locale::classic()也就是经典的C语境。  
+
+其实这个和我以前的理解不同，以前我就一直认为程序初始化的本地化是C语境，cppreference网站中std::locale这节的例子就说:[在启动时，全局本地环境是 "C" 本地环境](https://zh.cppreference.com/w/cpp/locale/locale)。有点糊涂了。  
+
+那程序是如何设置本地化的呢？其实下面那段代码的注释做出了说明：惰性初始化，也就是根据对象各自第一次使用时才去寻找当前要使用哪个本地化，然后初始化。所以setenv()这个函数才会有效。
+
+为什么Linux系统的本地化初始化会出现无效呢？  
+
+程序启动时默认的本地化到底是哪个？locale这段我也找了很多资料看，理解了不少，但还是没有完全掌握呀。
+
+```c++
+    // The path locale is lazy initialized and to avoid deinitialization errors
+    // in multithreading environments, it is set explicitly by the main thread.
+    // A dummy locale is used to extract the internal default locale, used by
+    // fs::path, which is then used to explicitly imbue the path.
+    std::locale loc = fs::path::imbue(std::locale::classic());
+    fs::path::imbue(loc);
+}
+```
+注释的意思是：因为是惰性初始化，boost::filesystem::path如果在不同线程中同时“第一次”调用时，可能会发生初始化错误。所以不如就在主线程中先显示设置它的初始化了。imbue的参数是随意找的，它没有任何用处，目的是获取当前的本地化，然后马上在path中显示设置这个本地化。
+
+为什么只有boost::filesystem::path会出现这个问题，其它的本地化没有吗，其它的都是线程安全的，就path线程不安全吗？
+
+---------------------------------------------------------------------------
+__当前位置：__ noui.cpp 第54行 noui_connect()
+```c++
+void noui_connect() {
+    // Connect bitcoind signal handlers
+    uiInterface.ThreadSafeMessageBox.connect(noui_ThreadSafeMessageBox);
+    uiInterface.ThreadSafeQuestion.connect(noui_ThreadSafeQuestion);
+    uiInterface.InitMessage.connect(noui_InitMessage);
+}
+```
+观察者模式或者信号槽在注册观察者或者槽函数，记下这三个信号，等到具体触发时再来解读它们的作用。
+
+---------------------------------------------------------------------
+__当前位置：__ bitcoind.cpp 第67行 AppInit()
+```c++
+bool AppInit(int argc, char *argv[]) {
+    boost::thread_group threadGroup;
+    CScheduler scheduler;
+
+    // FIXME: Ideally, we'd like to build the config here, but that's currently
+    // not possible as the whole application has too many global state. However,
+    // this is a first step.
+    auto &config = const_cast<Config &>(GetConfig());
+
+    bool fRet = false;
+```    
+threadGroup声明了一个boost::thread_group，用于管理一组线程，就像是一个线程池，内部使用std::list容器管理thread。
+
+通过查看scheduler.h头文件，发现CScheduler类似于一个定时器对象，处理各种定时任务或延迟任务，初始化也没啥内容，等到后面具体使用时在探究。
+
+FIXME是一种特殊的注释，表明注释处代码有待修正，甚至代码都是错误的，不能工作。这种特殊的注释还有TODO(注释处有功能待编写)和XXX(注释处代码虽然实现了功能，但有更好的实现方式，希望将来改进)。除了TODO，其它两个我还是第一次知道。
+    
+关于FIXME的解释：理想情况下，我们希望在这里构建配置，但是由于整个应用程序有太多的全局状态，所以目前不可能这样做。  
+意思是慢慢改哈...这不第一个就改好了，一个Config类，看一下Config类的声明和GetConfig函数发现还是有点意思，Config类是个纯虚类，GetConfig函数返回的是它的子类GlobalConfig，而且是定义在config.cpp的静态全局变量，因为是静态的无法通过extern声明外部使用，就怎了个函数GetConfig来获取，而且返回的是const引用，告诉你这个全局配置你获取后不能更改，而且因为继承自boost的noncopyable，也无法复制。不过因为这里是初始化，啥配置也没有，所以要用const_cast转换一下进行修改。
+
+那GlobalConfig里面是什么参数的配置呢？看看Config类的函数名，我们简单的猜测一哈，后面具体用到是再研究：
+* SetMaxBlockSize  设置区块大小的上限
+* SetBlockPriorityPercentage  不太明白啥意思
+* GetChainParams  针对不同网络(主网、测试网络、回归测试网络)的不同参数设置
+* SetCashAddrEncoding  设置现金地址的编码格式，bch改过地址格式，应该和这个有关
+* SetExcessUTXOCharge  也不太明白啥意思
+* SetMinFeePerKB 设置交易中每KB的最小费用
+
+```c++
+    // Parameters
+    //
+    // If Qt is used, parameters/bitcoin.conf are parsed in qt/bitcoin.cpp's
+    // main()
+    gArgs.ParseParameters(argc, argv);
+ ```
+这里就是在解析命令行参数了  
+gArgs是类ArgsManager的实例,顾名思义就是参数管理者，应该就是解析保存参数的地方吧。  
+这里就和前面的GlobalConfig不一样，gArgs是全局变量，在其头文件extern声明了，这里就直接用了
+
+-----------------------------------------------------------------------------
+__当前位置：__ util.cpp 第166行 ParseParameters()
+```c++
+void ArgsManager::ParseParameters(int argc, const char *const argv[]) {
+    LOCK(cs_args);
+    mapArgs.clear();
+    mapMultiArgs.clear();
+```
+cs_args是成员变量，类CCriticalSection的实例，看名字是带临界区功能的类，但f12一看:
+```c++
+//---------------------sync.h line 84-----------------------
+/**
+ * Wrapped boost mutex: supports recursive locking, but no waiting
+ * TODO: We should move away from using the recursive lock by default.
+ */
+class CCriticalSection : public AnnotatedMixin<boost::recursive_mutex> {
+public:
+    ~CCriticalSection() { DeleteLock((void *)this); }
+};
+```
+注释的意思是：封装了boost的锁，支持递归锁，但是no waiting，这个是指boost的递归锁本来提供了try_lock_for(some time)这种尝试在一定时间内锁定互斥量，过时则返回false的函数，这里应该没有封装这个函数。后面TODO说了：我们应该远离默认使用递归锁。看样子想要去掉模板参数boost::recursive_mutex。
+
+CCriticalSection类就一个析构，看来功能都继承自模板类AnnotatedMixin，f12看看：
+
+这里TODO为啥想要去除递归锁，出于哪些隐患的考虑，为何又不行动立即替换，而是写成一个TODO
+
+```c++
+//------------------sync.h line 50---------------------
+/**
+ * Template mixin that adds -Wthread-safety locking
+ * annotation在哪儿呢？ to a subset of the mutex API.
+ */
+template <typename PARENT> class LOCKABLE AnnotatedMixin : public PARENT {
+public:
+    void lock() EXCLUSIVE_LOCK_FUNCTION() { PARENT::lock(); }
+
+    void unlock() UNLOCK_FUNCTION() { PARENT::unlock(); }
+
+    bool try_lock() EXCLUSIVE_TRYLOCK_FUNCTION(true) {
+        return PARENT::try_lock();
+    }
+};
+```
+初始看的时候是懵的，注释也不太明白啥意思，代码里那几个宏是什么意思？还可以在函数括号后面、代码段前面添东西的咯，不过想想本来也可以添加const、override这种关键字的。宏的定义里还有(...)这种带省略号的，查了一下是可变参数宏，以前用的太少都没印象了...  
+
+mixin可以看做一种设计模式，虽然不在GOF御定义的23种中。主要思想就是给一个类增加多个功能，在支持多重继承的语言里使用多重继承就可以，然后实现每个父类的部分功能以达到mixin类的目的。  
+当然这里AnnotatedMixin类不是这样做的，字面意思理解它的主要功能是给互斥锁混合了一个注释锁的功能。继承自boost的互斥锁，实现了部分主要功能，然后annotation在哪儿呢？  
+搜索-Wthread-safety你会发现它是clang的一个编译选项，而那几个宏的定义是区分clang和非clang的，非clang的定义都是空，clang部分还有这样的注释：
+> The clang compiler can do advanced static analysis of locking when given the -Wthread-safety option.
+
+这样就比较明了了，这个mixin的功能只有用clang编译时才有效  
+
+让我们回到ParseParameters函数，接下来是LOCK宏，让我们看看LOCK的宏定义：
+```c++
+//----------------sync.h line 157----------------------
+typedef CMutexLock<CCriticalSection> CCriticalBlock;
+
+#define PASTE(x, y) x##y
+#define PASTE2(x, y) PASTE(x, y)
+
+#define LOCK(cs)                                                               \
+    CCriticalBlock PASTE2(criticalblock, __COUNTER__)(cs, #cs, __FILE__, __LINE__)
+```
+宏定义方面，##是连接符，#是字符串化，__COUNTER__是自身计数器，用于记录以前编译过程中出现的__COUNTER__的次数，从0开始计数。常用于构造一系列的变量名称，函数名称等。
+
+替换一下，这里就是在声明定义一个CMutexLock<CCriticalSection>对象，名字叫criticalblock1或者criticalblock2这样子。
+```c++
+//-----------------sync.h line 105-----------------
+/** Wrapper around boost::unique_lock<Mutex> */
+template <typename Mutex> class SCOPED_LOCKABLE CMutexLock {
+private:
+    boost::unique_lock<Mutex> lock;
+```
+CMutexLock就是一个boost::unique_lock<Mutex>的包装器，看看它的构造函数：
+```c++
+//-----------------sync.h line 130-----------------
+    CMutexLock(Mutex &mutexIn, const char *pszName, const char *pszFile,
+               int nLine, bool fTry = false) EXCLUSIVE_LOCK_FUNCTION(mutexIn)
+        : lock(mutexIn, boost::defer_lock) {
+        if (fTry)
+            TryEnter(pszName, pszFile, nLine);
+        else
+            Enter(pszName, pszFile, nLine);
+    }
+```
+boost::defer_lock是一种加锁策略，表示在构造时不加锁，请后面自己显示使用加锁函数。根据前面的宏定义，这里进入Enter函数。
+```c++
+//------------------sync.h line 110------------------
+void Enter(const char *pszName, const char *pszFile, int nLine) {
+        EnterCritical(pszName, pszFile, nLine, (void *)(lock.mutex()));
+#ifdef DEBUG_LOCKCONTENTION
+        if (!lock.try_lock()) {
+            PrintLockContention(pszName, pszFile, nLine);
+#endif
+            lock.lock();
+#ifdef DEBUG_LOCKCONTENTION
+        }
+#endif
+    }
+```
+再看看EnterCritical函数
+```c++
+//---------------------sync.h line 65--------------------------
+#ifdef DEBUG_LOCKORDER
+void EnterCritical(const char *pszName, const char *pszFile, int nLine,
+                   void *cs, bool fTry = false);
+void LeaveCritical();
+std::string LocksHeld();
+void AssertLockHeldInternal(const char *pszName, const char *pszFile, int nLine,
+                            void *cs);
+void DeleteLock(void *cs);
+#else
+static inline void EnterCritical(const char *pszName, const char *pszFile,
+                                 int nLine, void *cs, bool fTry = false) {}
+static inline void LeaveCritical() {}
+static inline void AssertLockHeldInternal(const char *pszName,
+                                          const char *pszFile, int nLine,
+                                          void *cs) {}
+static inline void DeleteLock(void *cs) {}
+#endif
+```
+只有在DEBUG_LOCKORDER时才有效，不然都是空实现，在对应的sync.cpp我发现了这样的注释：
+```c++
+//-------------------------sync.cpp line 21------------------
+#ifdef DEBUG_LOCKORDER
+//
+// Early deadlock detection.
+// Problem being solved:
+//    Thread 1 locks  A, then B, then C
+//    Thread 2 locks  D, then C, then A
+//     --> may result in deadlock between the two threads, depending on when
+//     they run.
+// Solution implemented here:
+// Keep track of pairs of locks: (A before B), (A before C), etc.
+// Complain if any thread tries to lock in a different order.
+//
+```
+和之前那个mixin一样也是在调试时跟踪锁的行为，这里是加锁的顺序。  
+
+然后在sync.h的开头我又发现了这样的注释
+```c++
+//---------------sync.h line 16--------------------
+/////////////////////////////////////////////////
+//                                             //
+// THE SIMPLE DEFINITION, EXCLUDING DEBUG CODE //
+//                                             //
+/////////////////////////////////////////////////
+
+/*
+CCriticalSection mutex;
+    boost::recursive_mutex mutex;
+
+LOCK(mutex);
+    boost::unique_lock<boost::recursive_mutex> criticalblock(mutex);
+
+LOCK2(mutex1, mutex2);
+    boost::unique_lock<boost::recursive_mutex> criticalblock1(mutex1);
+    boost::unique_lock<boost::recursive_mutex> criticalblock2(mutex2);
+
+TRY_LOCK(mutex, name);
+    boost::unique_lock<boost::recursive_mutex> name(mutex,
+boost::try_to_lock_t);
+
+ENTER_CRITICAL_SECTION(mutex); // no RAII
+    mutex.lock();
+
+LEAVE_CRITICAL_SECTION(mutex); // no RAII
+    mutex.unlock();
+ */
+ ```
+ 如果去除掉调试的代码，这个sync模块其实就长这样：一个用unique_lock管理的递归锁而已...哈哈哈
+ 
+ EnterCritical函数的具体行为我们暂时不深入研究了，感觉有点偏离主题初始化了。
+ 
+ 总之LOCK(cs_args)说了半天，就是个锁，让我们回到ParseParameters的讨论。
+ 
+ --------------------------------------
+__当前位置：__ util.cpp 第171行 ParseParameters()
+ 
+ ```c++
+ for (int i = 1; i < argc; i++) {
+        std::string str(argv[i]);
+        std::string strValue;
+        size_t is_index = str.find('=');
+        if (is_index != std::string::npos) {
+            strValue = str.substr(is_index + 1);
+            str = str.substr(0, is_index);
+        }
+```
+这里做的就是让形如 -foo=bar 分解为 str=-foo、strValue=bar。
+
+```c++
+#ifdef WIN32
+        boost::to_lower(str);
+        if (boost::algorithm::starts_with(str, "/")) str = "-" + str.substr(1);
+#endif
+```
+意思是win32环境中，可以使用 /foo=bar ，代码会自动替换‘/’为‘-’，为嘛win32可以使用‘/’开头的，搞特殊嗦...
+
+```c++
+		if (str[0] != '-') break;
+
+        // Interpret --foo as -foo.
+        // If both --foo and -foo are set, the last takes effect.
+        if (str.length() > 1 && str[1] == '-') str = str.substr(1);
+        InterpretNegativeSetting(str, strValue);
+
+        mapArgs[str] = strValue;
+        mapMultiArgs[str].push_back(strValue);
+    }
+}
+```
+参数必须以‘-’开头，将双横杠’--‘开头的替换为’-‘  
+InterpretNegativeSetting是将 -nofoo 变为 -foo=0， 这样str=foo、strValue=0
+
+总之，ParseParameters就是做一些常规的参数解析，然后保存到map里面，并用锁来保护这些数据
+
+现在，让我们回到AppInit函数继续阅读。
+
+-------------------------------
+__当前位置：__ bitcoind.cpp 第85行 AppInit()
+```c++
+    // Process help and version before taking care about datadir
+    if (gArgs.IsArgSet("-?") || gArgs.IsArgSet("-h") ||
+        gArgs.IsArgSet("-help") || gArgs.IsArgSet("-version")) {
+        std::string strUsage = strprintf(_("%s Daemon"), _(PACKAGE_NAME)) +
+                               " " + _("version") + " " + FormatFullVersion() +
+                               "\n";
+
+        if (gArgs.IsArgSet("-version")) {
+            strUsage += FormatParagraph(LicenseInfo());
+        } else {
+            strUsage += "\n" + _("Usage:") + "\n" +
+                        "  bitcoind [options]                     " +
+                        strprintf(_("Start %s Daemon"), _(PACKAGE_NAME)) + "\n";
+
+            strUsage += "\n" + HelpMessage(HMM_BITCOIND);
+        }
+
+        fprintf(stdout, "%s", strUsage.c_str());
+        return true;
+    }
+```
+这一段是帮助信息的打印，然后退出。
+
+strprintf和名字叫 _ 的函数，后面有空深入看一哈。
+
+```c++
+    try {
+        if (!fs::is_directory(GetDataDir(false))) {
+            fprintf(stderr,
+                    "Error: Specified data directory \"%s\" does not exist.\n",
+                    gArgs.GetArg("-datadir", "").c_str());
+            return false;
+        }
+```
+获取数据文件，如果不存在则直接返回false程序退出
+
+看看GetDataDir函数。
+
+-----------------------
+__当前位置：__ util.cpp 第336行 GetDataDir()  
+```c++
+const fs::path &GetDataDir(bool fNetSpecific) {
+    LOCK(csPathCached);
+
+    fs::path &path = fNetSpecific ? pathCachedNetSpecific : pathCached;
+
+    // This can be called during exceptions by LogPrintf(), so we cache the
+    // value so we don't have to do memory allocations after that.
+    if (!path.empty()) return path;
+
+    if (gArgs.IsArgSet("-datadir")) {
+        path = fs::system_complete(gArgs.GetArg("-datadir", ""));
+        if (!fs::is_directory(path)) {
+            path = "";
+            return path;
+        }
+    } else {
+        path = GetDefaultDataDir();
+    }
+    if (fNetSpecific) path /= BaseParams().DataDir();
+
+    fs::create_directories(path);
+
+    return path;
+}
+```
+这段注释还没看懂啥意思。  
+if (!path.empty()) return path;这句表示如果已经有值了就直接用，但我搜索了pathCached这两个变量的出处，并没有给它们赋值的代码......  
+
+后面这个是在看命令行参数中是否声明了datadir，有就使用该path,否则使用默认的datadir。GetDefaultDataDir函数的注释里写明了各个环境下的默认path，在我的Ubuntu上是~/.bitcoin。
+
+NetSpecific是特定网络的意思，BaseParams()会返回一个CBaseChainParams指针，这个类定义里面就定义了三个静态常量字符串：MAIN，TESTNET，REGTEST；也就是主网、测试网络和回归测试网络。如果fNetSpecific为true则path后面还要接上网络类型名字作为path，不过初始化是这个变量是false。
+
+回到AppInit函数继续阅读。
+
+--------------------------------------
+__当前位置：__ bitcoind.cpp 第113行 AppInit()
+```c++
+		try {
+            gArgs.ReadConfigFile(gArgs.GetArg("-conf", BITCOIN_CONF_FILENAME));
+        } catch (const std::exception &e) {
+            fprintf(stderr, "Error reading configuration file: %s\n", e.what());
+            return false;
+        }
+```
+GetArg函数先看命令行有没有指定配置文件名，否则使用默认的配置文件名bitcoin.conf。 
+
+ReadConfigFile函数读取该配置文件，和之前解析命令行参数一样也是由ArgsManager类管理，如果没有该文件也没有影响，返回后继续执行后面的代码。配置文件中的参数没有”-“符号，ArgsManager会添上的。
+
+```c++
+		// Check for -testnet or -regtest parameter (Params() calls are only
+        // valid after this clause)
+        try {
+            SelectParams(ChainNameFromCommandLine());
+        } catch (const std::exception &e) {
+            fprintf(stderr, "Error: %s\n", e.what());
+            return false;
+        }
+```
+ChainNameFromCommandLine看字面意思从命令行获取当前的网络名称，不过前面已经读取了命令行和conf配置文件，所以这个命名感觉不太好...如果同时设置了测试网络和回归测试网络是会抛出运行时错误的哦。
+
+SelectParams配置对应网络的参数，分为CBaseChainParams和CChainParams。  
+
+CBaseChainParams设置RPC通信的端口号和数据文件的目录名，比如TESTNET的端口号是18332，数据存放的文件名叫testnet3.
+
+CChainParams就要复杂得多，我们看看它的成员变量们：
+```c++
+	Consensus::Params consensus;
+    CMessageHeader::MessageMagic diskMagic;
+    CMessageHeader::MessageMagic netMagic;
+    int nDefaultPort;
+    uint64_t nPruneAfterHeight;
+    std::vector<CDNSSeedData> vSeeds;
+    std::vector<uint8_t> base58Prefixes[MAX_BASE58_TYPES];
+    std::string cashaddrPrefix;
+    std::string strNetworkID;
+    CBlock genesis;
+    std::vector<SeedSpec6> vFixedSeeds;
+    bool fMiningRequiresPeers;
+    bool fDefaultConsistencyChecks;
+    bool fRequireStandard;
+    bool fMineBlocksOnDemand;
+    CCheckpointData checkpointData;
+    ChainTxData chainTxData;
+```
+下面我们以主网的创建来看看这些变量的意义。
+
+-------------------------------
+__当前位置：__ chainparams.cpp 第88行
+```c++
+class CMainParams : public CChainParams {
+public:
+    CMainParams() {
+        strNetworkID = "main";
+        ......太长了省略掉
+    }
+};
+```
+strNetworkID就是网络的名字，这里是主网”main“;  
+
+consensus是共识层，是大家达成共识的一些参数：  
+* nSubsidyHalvingInterval 奖励减半的间隔，每210000个块
+* BIP34Height bip34激活时的区块高度
+* BIP34Hash   bip34激活时的区块哈希
+* BIP65Height  bip66激活时的区块高度
+* BIP66Height  bip66激活时的区块高度（这几个bip单独拿出来是因为都是软分叉，修改了共识层）
+* powLimit  最小的工作量证明难度值，前面才8个0（对比三个网络，你会发现回归测试网络一个0都没有，就是专门给个人本地测试用的，免得你的CPU半天挖不出一个块来）
+* nPowTargetTimespan  难度调整的时间，主网是两周
+* nPowTargetSpacing  理想的平均出块时间，主网10分钟
+* fPowAllowMinDifficultyBlocks  是否允许挖最小难度的区块
+* fPowNoRetargeting  是否需要调整难度(这两个参数应该是给测试网络用的)
+* nRuleChangeActivationThreshold  这个还不太明白啥意思？
+* nMinerConfirmationWindow  挖矿确认窗口，每2016个块调整难度
+* vDeployments  这是一个BIP9Deployment类，类注释说：使用BIP9改变每个共识规则的结构。这个结构体里面的变量还不太明白啥意思。
+* nMinimumChainWork  好的区块应该不能低于这个工作量？ 
+* defaultAssumeValid  默认这个块之前的签名都是有效的。意思是前面的免检了吗？
+* uahfHeight  bch硬分叉时的区块高度
+* daaHeight   bch激活daa难度算法的区块高度
+* monolithActivationTime 18.5.15硬分叉时的激活时间（居然不按高度算了）
+* magneticAnomalyActivationTime  18.11.15硬分叉的激活时间
+* hashGenesisBlock   创世区块的哈希值
+
+diskMagic和netMagic都是比特币网络协议中定义消息的消息头的前四个字节。注释说明：消息启动字符串被设计为不太可能出现在正常的数据中。字符很少使用大写ASCII，就避免被识别为有效的UTF-8字符，并产生一个大的32位整数与任何对齐（这句没明白啥意思）。
+
+nDefaultPort  默认端口
+
+nPruneAfterHeight  在这个区块高度后开始裁剪（当然要配置为裁剪模式），不知我理解对不？
+
+genesis 创世区块
+
+vSeeds 这是DNS seed的容器，DNS seed是比特币网络上完整节点IP地址的DNS服务器，用于协助发现节点，这里添加了几个固定的服务器
+
+base58Prefixes base58编码格式的前缀，用于区别不同的类型（公钥地址、私钥、脚本地址、EXT_PUBLIC_KEY额外的公钥、EXT_SECRET_KEY额外的私钥）
+
+cashaddrPrefix  比特币现金地址前缀”bitcoincash“
+
+vFixedSeeds 固定的seed，还不太明白啥意思 
+
+fMiningRequiresPeers  
+
+fDefaultConsistencyChecks  默认是否进行一致性检查
+
+fRequireStandard
+
+fMineBlocksOnDemand
+
+checkpointData  区块检查点数据，被设为检查点的区块的哈希值必须与代码中的一致
+
+chainTxData 链的交易数据，包含一个时间戳，从创世区块到该时间戳的交易总数、该时间戳以后的一个tps预估值。这个有啥用？
+
+这下对共识数据有了一定了解，让我们回到初始化函数。
+
+```c++
+		// Command-line RPC
+        bool fCommandLine = false;
+        for (int i = 1; i < argc; i++)
+            if (!IsSwitchChar(argv[i][0]) &&
+                !boost::algorithm::istarts_with(argv[i], "bitcoin:"))
+                fCommandLine = true;
+
+        if (fCommandLine) {
+            fprintf(stderr, "Error: There is no RPC client functionality in "
+                            "bitcoind anymore. Use the bitcoin-cli utility "
+                            "instead.\n");
+            exit(EXIT_FAILURE);
+        }
+```
+如果命令行中有以”bitcoin:“开头的参数，会报错：bitcoind没有RPC客户端功能哦，请使用bitcoin-cli组件。
+
+```c++
+		// -server defaults to true for bitcoind but not for the GUI so do this
+        // here
+        gArgs.SoftSetBoolArg("-server", true);
+```
+主动设置一个server参数，现在还不知道具体有何用。
+
+```c++
+		// Set this early so that parameter interactions go to console
+        InitLogging();
+```
+初始化日志类，设置是否打印控制台、是否打印时间戳，是否打印毫秒，是否打印IP等设置。
+
+```c++
+InitParameterInteraction();
+```
+各个参数相关性的设置，比如当	设置了bind参数时，listen参数就自动设置为true。
+
+初始化step0完成了，总结一下：  
+这是一个准备的阶段，程序启动时的一些特殊处理（glibc、本地化locale等）。然后就是从命令行和配置文件读取并解析参数，对部分参数做相关性和正确性的检查。根据参数来初始化网络类型的参数，网络类型的不同，也使得共识层、挖矿方式、网络协议消息头等都会有不一样的地方。初始化日志类，根据参数设置日志格式。
+
+
+
+        
+     
+     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
